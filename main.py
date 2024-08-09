@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import asyncio
 import logging
-import random
 from typing import Annotated, Any
 from uuid import uuid1
 
-from fastapi import FastAPI, Query
+from fastapi import Body, FastAPI, Query
 from pydantic import BaseModel
+
+from tasks import factory as tasks_factory
 
 logger = logging.getLogger(__name__)
 
@@ -87,29 +90,32 @@ class TaskNotInProcessErrorInfo(ErrorInfo):
 tasks: dict[str, TaskData] = {}
 
 
-@app.post("/create-test-task/")
-async def create_task(name: str, delay: float | None = None) -> TaskInfo:
-    if delay is None:
-        delay = random.randint(1, 1000)
-
+def _create_task(name: str, *args, **kwargs) -> str:
     task_data = TaskData()
     task_data.uuid = str(uuid1())
-    task_data.task = asyncio.create_task(asyncio.sleep(delay), name=name)
-    task_data.kwargs = {"delay": delay}
+    task_data.task = tasks_factory[name](**kwargs)  # TODO: try/except ('name doesn't exist', 'kwargs is wrong')
+    task_data.kwargs = kwargs
 
     tasks[task_data.uuid] = task_data
 
-    return task_data.to_task_info()
+    return task_data.uuid
 
 
-def cancel_task(id_: str) -> None:
+def _cancel_task(id_: str) -> None:
     tasks[id_].task.cancel()
 
 
-def delete_task(id_: str) -> None:
+def _delete_task(id_: str) -> None:
     if not tasks[id_].task.done():
         tasks[id_].task.cancel()
     del tasks[id_]
+
+
+@app.post("/create-task/")
+async def create_task(params: Annotated[dict[str, Any], Body()]) -> TaskInfo:
+    name = params.pop("name")
+    uuid = _create_task(name, **params)
+    return tasks[uuid].to_task_info()
 
 
 # create
@@ -124,12 +130,12 @@ async def create_tasks(
         elif tasks[id_].state_result[0] not in ["SUCCESS", "REVOKED"]:
             res[id_] = TaskInProcessErrorInfo()
         else:
-            task_data_clone = tasks[id_]
-            task = await create_task(
-                task_data_clone.task.get_name(),
-                **task_data_clone.kwargs,
+            task_data_template = tasks[id_]
+            uuid = _create_task(
+                task_data_template.task.get_name(),
+                **task_data_template.kwargs,
             )
-            res[id_] = task
+            res[id_] = tasks[uuid].to_task_info()
 
     return res
 
@@ -164,7 +170,7 @@ async def update_tasks(
             if tasks[id_].state_result[0] in ["PENDING", "STARTED", "RETRY"]
         ]
         for id_ in running_task_ids:
-            cancel_task(id_)
+            _cancel_task(id_)
         return {}  # it would be good to return state and finish time; does they finish during http request?
 
     res: dict[str, ErrorInfo] = {}
@@ -174,7 +180,7 @@ async def update_tasks(
         elif tasks[id_].state_result[0] in ["SUCCESS", "FAILURE", "REVOKED"]:
             res[id_] = TaskNotInProcessErrorInfo()
         else:
-            cancel_task(id_)
+            _cancel_task(id_)
 
     return res
 
@@ -186,7 +192,7 @@ async def delete_tasks(
 ) -> dict[str, ErrorInfo]:
     if ids is None:
         for id_ in list(tasks.keys()):
-            cancel_task(id_)
+            _cancel_task(id_)
         return {}
 
     res: dict[str, ErrorInfo] = {}
@@ -194,6 +200,6 @@ async def delete_tasks(
         if id_ not in tasks:
             res[id_] = TaskNotExistErrorInfo()
         else:
-            delete_task(id_)
+            _delete_task(id_)
 
     return res
