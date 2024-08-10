@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Annotated, Any
 from uuid import uuid1
 
-from fastapi import Body, FastAPI, Query
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
 
 from tasks import factory as tasks_factory
@@ -15,27 +16,34 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 
-# states:
-# 'PENDING'  # Task is waiting for execution or unknown. Any task id that’s not known is implied to be in the pending state.
-# 'STARTED'  # Task has been started. Not reported by default, to enable please see app.Task.track_started.
-# 'SUCCESS'  # Task has been successfully executed.
-# 'FAILURE'  # Task execution resulted in failure.
-# 'RETRY'  # Task is being retried.
-# 'REVOKED'  # Task has been revoked.
-
-
-class TaskInfo(BaseModel):
-    uuid: str
-    name: str
-    kwargs: dict[str, Any]
-    state: str
-    result: Any | None = None
-
-
 class TaskData:
     uuid: str
     task: asyncio.Task
     kwargs: dict[str, Any]
+    start_date: datetime
+    end_date: datetime | None
+
+    def __init__(self) -> None:
+        self.start_date = datetime.now()
+        self.end_date = None
+
+    # states:
+    # 'PENDING'  # Task is waiting for execution or unknown. Any task id that’s not known is implied to be in the pending state.
+    # 'STARTED'  # Task has been started. Not reported by default, to enable please see app.Task.track_started.
+    # 'SUCCESS'  # Task has been successfully executed.
+    # 'FAILURE'  # Task execution resulted in failure.
+    # 'RETRY'  # Task is being retried.
+    # 'REVOKED'  # Task has been revoked.
+
+    def is_in_process(self) -> bool:
+        return self.state_result[0] in ["PENDING", "STARTED", "RETRY"]
+
+    def is_not_in_process(self) -> bool:
+        return self.state_result[0] in ["SUCCESS", "FAILURE", "REVOKED"]
+
+    @property
+    def name(self) -> str:
+        return self.task.get_name()
 
     @property
     def state_result(self) -> tuple[str, Any]:
@@ -52,48 +60,85 @@ class TaskData:
 
         return state, result
 
-    def to_task_info(self) -> TaskInfo:
-        task_info = TaskInfo(
-            uuid=self.uuid,
-            name=self.task.get_name(),
-            kwargs=self.kwargs,
-            state="PENDING",
-        )
-        task_info.state, task_info.result = self.state_result
-
-        return task_info
-
-
-class ErrorInfo(BaseModel):
-    code: int
-    msg: str
-
-
-class TaskNotExistErrorInfo(ErrorInfo):
-    def __init__(self) -> None:
-        super().__init__(code=0, msg="the task doesn't exist")
-        # can be add args field to store infarmation about tash id
-
-
-class TaskInProcessErrorInfo(ErrorInfo):
-    def __init__(self) -> None:
-        super().__init__(code=1, msg="task is in process")
-        # can be add args field to store infarmation about tash id
-
-
-class TaskNotInProcessErrorInfo(ErrorInfo):
-    def __init__(self) -> None:
-        super().__init__(code=2, msg="task is not in process")
-        # can be add args field to store infarmation about tash id
-
 
 tasks: dict[str, TaskData] = {}
 
 
-def _create_task(name: str, *args, **kwargs) -> str:
+class TaskInfo(BaseModel):
+    uuid: str
+    name: str
+    kwargs: dict[str, Any]
+    start_date: datetime
+    end_date: datetime | None
+    state: str
+    result: Any | None = None
+
+    @staticmethod
+    def from_task_data(task_data: TaskData) -> TaskInfo:
+        task_info = TaskInfo(
+            uuid=task_data.uuid,
+            name=task_data.task.get_name(),
+            kwargs=task_data.kwargs,
+            start_date=task_data.start_date,
+            end_date=task_data.end_date,
+            state="PENDING",
+        )
+        task_info.state, task_info.result = task_data.state_result
+
+        return task_info
+
+
+def _get_task_info(id_: str) -> TaskInfo:
+    return TaskInfo.from_task_data(tasks[id_])
+
+
+class ErrorInfo(BaseModel):
+    uuid: str
+    error_code: int
+    error_msg: str
+
+    @staticmethod
+    def not_exist_data(uuid: str):
+        return ErrorInfo(
+            uuid=uuid,
+            error_code=0,
+            error_msg="the task does not exist",
+        )
+
+    @staticmethod
+    def in_process_data(uuid: str):
+        return ErrorInfo(
+            uuid=uuid,
+            error_code=0,
+            error_msg="task is in process",
+        )
+
+    @staticmethod
+    def not_in_process_data(uuid: str):
+        return ErrorInfo(
+            uuid=uuid,
+            error_code=0,
+            error_msg="task is not in process",
+        )
+
+
+def _create_task(name: str, **kwargs) -> str:
+    task = next(
+        (
+            x
+            for x in tasks.values()
+            if x.name == name and x.kwargs == kwargs and x.is_in_process()
+        ),
+        None,
+    )  # it can be O(1) if use something like index precalculated before
+    if task is not None:
+        return None
+
+    task = tasks_factory[name](**kwargs)
+
     task_data = TaskData()
     task_data.uuid = str(uuid1())
-    task_data.task = tasks_factory[name](**kwargs)  # TODO: try/except ('name doesn't exist', 'kwargs is wrong')
+    task_data.task = task
     task_data.kwargs = kwargs
 
     tasks[task_data.uuid] = task_data
@@ -103,6 +148,7 @@ def _create_task(name: str, *args, **kwargs) -> str:
 
 def _cancel_task(id_: str) -> None:
     tasks[id_].task.cancel()
+    tasks[id_].end_date = datetime.now()
 
 
 def _delete_task(id_: str) -> None:
@@ -111,95 +157,88 @@ def _delete_task(id_: str) -> None:
     del tasks[id_]
 
 
-@app.post("/create-task/")
-async def create_task(params: Annotated[dict[str, Any], Body()]) -> TaskInfo:
-    name = params.pop("name")
-    uuid = _create_task(name, **params)
-    return tasks[uuid].to_task_info()
+@app.post("/sleep-task-creator/")
+async def create_sleep_task(delay: Annotated[float, Query()]) -> TaskInfo:
+    uuid = _create_task("sleep_task", delay=delay)
+    return TaskInfo.from_task_data(tasks[uuid])
 
 
-# create
 @app.post("/tasks/")
-async def create_tasks(
+async def recreate_tasks(
     ids: Annotated[list[str], Query()],
-) -> dict[str, TaskInfo | ErrorInfo]:
-    res: dict[str, TaskInfo | ErrorInfo] = {}
+) -> list[TaskInfo | ErrorInfo]:
+    res: list[TaskInfo | ErrorInfo] = []
     for id_ in set(ids):
         if id_ not in tasks:
-            res[id_] = TaskNotExistErrorInfo()
-        elif tasks[id_].state_result[0] not in ["SUCCESS", "REVOKED"]:
-            res[id_] = TaskInProcessErrorInfo()
-        else:
-            task_data_template = tasks[id_]
-            uuid = _create_task(
-                task_data_template.task.get_name(),
-                **task_data_template.kwargs,
-            )
-            res[id_] = tasks[uuid].to_task_info()
+            res.append(ErrorInfo.not_exist_data(id_))
+            continue
+        if tasks[id_].is_in_process():
+            res.append(ErrorInfo.in_process_data(id_))
+            continue
+
+        task_data_template = tasks[id_]
+        uuid = _create_task(
+            task_data_template.name,
+            **task_data_template.kwargs,
+        )
+        res.append(_get_task_info(uuid))
 
     return res
 
 
-# read (get tasks information)
 @app.get("/tasks/")
 async def read_tasks(
     ids: Annotated[list[str] | None, Query()] = None,
-) -> dict[str, TaskInfo | ErrorInfo]:
+) -> list[TaskInfo | ErrorInfo]:
     if ids is None:
-        return {
-            task_uuid: task_data.to_task_info()
-            for task_uuid, task_data in tasks.items()
-        }
+        return [_get_task_info(uuid) for uuid in tasks]
 
-    res: dict[str, TaskInfo | ErrorInfo] = {
-        id_: tasks[id_].to_task_info() if id_ in tasks else TaskNotExistErrorInfo()
+    res: list[TaskInfo | ErrorInfo] = [
+        _get_task_info(id_) if id_ in tasks else ErrorInfo.not_exist_data(id_)
         for id_ in ids
-    }
+    ]
     return res
 
 
-# update (cancel tasks)
 @app.patch("/tasks/")
-async def update_tasks(
+async def cancel_tasks(
     ids: Annotated[list[str] | None, Query()] = None,
-) -> dict[str, ErrorInfo]:
+) -> list[ErrorInfo]:
     if ids is None:
-        running_task_ids = [
-            id_
-            for id_ in tasks
-            if tasks[id_].state_result[0] in ["PENDING", "STARTED", "RETRY"]
-        ]
+        running_task_ids = [id_ for id_ in tasks if tasks[id_].is_not_in_process()]
         for id_ in running_task_ids:
             _cancel_task(id_)
-        return {}  # it would be good to return state and finish time; does they finish during http request?
+        return []  # it would be good to return state and finish time; is they finished during http request?
 
-    res: dict[str, ErrorInfo] = {}
+    res: list[ErrorInfo] = []
     for id_ in set(ids):
         if id_ not in tasks:
-            res[id_] = TaskNotExistErrorInfo()
-        elif tasks[id_].state_result[0] in ["SUCCESS", "FAILURE", "REVOKED"]:
-            res[id_] = TaskNotInProcessErrorInfo()
-        else:
-            _cancel_task(id_)
+            res.append(ErrorInfo.not_exist_data(id_))
+            continue
+        if tasks[id_].is_not_in_process():
+            res.append(ErrorInfo.not_in_process_data(id_))
+            continue
+
+        _cancel_task(id_)
 
     return res
 
 
-# delete
 @app.delete("/tasks/")
 async def delete_tasks(
     ids: Annotated[list[str] | None, Query()] = None,
-) -> dict[str, ErrorInfo]:
+) -> list[ErrorInfo]:
     if ids is None:
         for id_ in list(tasks.keys()):
             _cancel_task(id_)
-        return {}
+        return []
 
-    res: dict[str, ErrorInfo] = {}
+    res: list[ErrorInfo] = []
     for id_ in set(ids):
         if id_ not in tasks:
-            res[id_] = TaskNotExistErrorInfo()
-        else:
-            _delete_task(id_)
+            res.append(ErrorInfo.not_exist_data(id_))
+            continue
+
+        _delete_task(id_)
 
     return res
