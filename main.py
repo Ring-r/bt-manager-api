@@ -123,7 +123,7 @@ class ErrorInfo(BaseModel):
 
 
 def _create_task(name: str, **kwargs) -> str:
-    task = next(
+    duplicated_task_data = next(
         (
             x
             for x in tasks.values()
@@ -131,8 +131,8 @@ def _create_task(name: str, **kwargs) -> str:
         ),
         None,
     )  # it can be O(1) if use something like index precalculated before
-    if task is not None:
-        return None
+    if duplicated_task_data is not None:
+        return duplicated_task_data.uuid
 
     task = tasks_factory[name](**kwargs)
 
@@ -142,6 +142,12 @@ def _create_task(name: str, **kwargs) -> str:
     task_data.kwargs = kwargs
 
     tasks[task_data.uuid] = task_data
+
+    def finish_callback(_: Any) -> None:
+        task_data.end_date = datetime.now()
+        # can be run signal about data changed
+
+    task.add_done_callback(finish_callback)
 
     return task_data.uuid
 
